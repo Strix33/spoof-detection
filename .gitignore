@@ -1,0 +1,8 @@
+raw/
+*.xlsx
+*.zip
+*.log
+catboost_info/
+__pycache__/
+.vscode/
+.idea/
