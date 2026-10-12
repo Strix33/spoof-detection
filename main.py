@@ -1,17 +1,26 @@
 import os
 import cv2
+import warnings
 import numpy as np
 import pandas as pd
+warnings.filterwarnings('ignore')
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.svm import SVC
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    HistGradientBoostingClassifier,
+    ExtraTreesClassifier,
+    VotingClassifier,
+    StackingClassifier
+)
+from sklearn.svm import SVC, LinearSVC
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.naive_bayes import GaussianNB
+from sklearn.naive_bayes import GaussianNB, BernoulliNB
 from sklearn.neural_network import MLPClassifier
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
 
 try:
     from xgboost import XGBClassifier
@@ -59,28 +68,38 @@ def load_dataset(data_dir):
     return image_paths, class_labels
 
 
-def get_models():
+def get_top_3_families():
     """
-    Returns the dictionary of machine learning classifiers.
+    Returns the top 3 performing model families for spoof detection.
     """
-    models = {
-        "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
-        "K-Nearest Neighbors": KNeighborsClassifier(),
+    tree_boosting = {
         "Decision Tree": DecisionTreeClassifier(random_state=42),
         "Random Forest": RandomForestClassifier(n_estimators=50, n_jobs=-1, random_state=42),
-        "Support Vector Machine": SVC(random_state=42, probability=True),
-        "Gradient Boosting": GradientBoostingClassifier(random_state=42),
-        "Gaussian Naive Bayes": GaussianNB(),
-        "MLP Classifier": MLPClassifier(max_iter=500, random_state=42),
-        "Linear Discriminant Analysis": LinearDiscriminantAnalysis()
+        "Extra Trees": ExtraTreesClassifier(n_estimators=50, n_jobs=-1, random_state=42),
+        "Hist Gradient Boosting": HistGradientBoostingClassifier(random_state=42)
+    }
+    if BOOSTING_AVAILABLE:
+        tree_boosting["XGBoost"] = XGBClassifier(eval_metric='logloss', n_jobs=-1, random_state=42)
+        tree_boosting["LightGBM"] = LGBMClassifier(n_jobs=-1, random_state=42, verbose=-1)
+        tree_boosting["CatBoost"] = CatBoostClassifier(verbose=0, iterations=50, thread_count=-1, random_state=42)
+
+    distance_kernel = {
+        "K-Nearest Neighbors": KNeighborsClassifier(n_jobs=-1),
+        "SVM (RBF Kernel)": SVC(kernel='rbf', max_iter=1000, cache_size=1000, random_state=42, probability=True),
+        "Linear SVM": CalibratedClassifierCV(LinearSVC(dual='auto', max_iter=2000, random_state=42))
     }
 
-    if BOOSTING_AVAILABLE:
-        models["XGBoost"] = XGBClassifier(eval_metric='logloss', random_state=42)
-        models["LightGBM"] = LGBMClassifier(n_jobs=-1, random_state=42, verbose=-1)
-        models["CatBoost"] = CatBoostClassifier(verbose=0, iterations=100, random_state=42)
+    probabilistic_bayes = {
+        "Gaussian Naive Bayes": GaussianNB(),
+        "Quadratic Discriminant Analysis": QuadraticDiscriminantAnalysis(reg_param=0.1),
+        "Bernoulli Naive Bayes": BernoulliNB()
+    }
 
-    return models
+    return {
+        "Tree & Boosting Family": tree_boosting,
+        "Distance & Kernel Family": distance_kernel,
+        "Probabilistic & Bayes Family": probabilistic_bayes
+    }
 
 
 def main():
@@ -103,8 +122,8 @@ def main():
         image_paths = [image_paths[i] for i in idx]
         class_labels = [class_labels[i] for i in idx]
 
-    n_values = [2, 4, 8, 16,20,24,32,40,48,56,64]
-    models = get_models()
+    n_values = [2, 4, 8, 16, 20, 24, 32, 40, 48, 56, 64,70,90,110,130,150,170,340,520,620]
+    families = get_top_3_families()
     all_accuracies = {}
 
     for n in n_values:
@@ -120,36 +139,78 @@ def main():
         kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
         res = {}
-        for name, model in models.items():
+        all_family_models = {}
+
+        # 1. Evaluate Individual Models & Create Intra-Family Voting Ensembles
+        for fam_name, models in families.items():
+            print(f"\n  [{fam_name}]")
+            for name, model in models.items():
+                scores = []
+                for tr, ts in kf.split(X_arr, y_arr):
+                    model.fit(X_arr[tr], y_arr[tr])
+                    preds = model.predict(X_arr[ts])
+                    scores.append(accuracy_score(y_arr[ts], preds))
+                res[(fam_name, name)] = float(np.mean(scores))
+                print(f"    {name:<35}: {res[(fam_name, name)]:.4f}")
+                all_family_models[f"{fam_name}_{name}"] = model
+
+            # Build Intra-Family Hard Voting Ensemble
+            estimators = [(m_name.replace(' ', '_'), m_obj) for m_name, m_obj in models.items()]
+            intra_ensemble = VotingClassifier(estimators=estimators, voting='hard')
             scores = []
             for tr, ts in kf.split(X_arr, y_arr):
-                model.fit(X_arr[tr], y_arr[tr])
-                preds = model.predict(X_arr[ts])
+                intra_ensemble.fit(X_arr[tr], y_arr[tr])
+                preds = intra_ensemble.predict(X_arr[ts])
                 scores.append(accuracy_score(y_arr[ts], preds))
-            res[name] = float(np.mean(scores))
-            print(f"  {name:<30}: {res[name]:.4f}")
+            res[(fam_name, 'Intra_Family_Voting_Ensemble')] = float(np.mean(scores))
+            print(f"    {'Intra_Family_Voting_Ensemble':<35}: {res[(fam_name, 'Intra_Family_Voting_Ensemble')]:.4f}")
+
+        # 2. Inter-Family Meta Ensemble (Combining Top 3 Families)
+        print(f"\n  [Ensemble Learning - Inter Family]")
+        top_meta_estimators = [
+            ("Tree_ExtraTrees", ExtraTreesClassifier(n_estimators=50, n_jobs=-1, random_state=42)),
+            ("Distance_KNN", KNeighborsClassifier(n_jobs=-1)),
+            ("Probabilistic_QDA", QuadraticDiscriminantAnalysis(reg_param=0.1))
+        ]
+
+        # Inter-Family Voting Ensemble
+        inter_voting = VotingClassifier(estimators=top_meta_estimators, voting='hard')
+        scores = []
+        for tr, ts in kf.split(X_arr, y_arr):
+            inter_voting.fit(X_arr[tr], y_arr[tr])
+            preds = inter_voting.predict(X_arr[ts])
+            scores.append(accuracy_score(y_arr[ts], preds))
+        res[('Ensemble Learning', 'Inter_Family_Voting_Ensemble')] = float(np.mean(scores))
+        print(f"    {'Inter_Family_Voting_Ensemble':<35}: {res[('Ensemble Learning', 'Inter_Family_Voting_Ensemble')]:.4f}")
+
+        # Inter-Family Stacking Classifier
+        inter_stacking = StackingClassifier(estimators=top_meta_estimators, final_estimator=LogisticRegression(random_state=42))
+        scores = []
+        for tr, ts in kf.split(X_arr, y_arr):
+            inter_stacking.fit(X_arr[tr], y_arr[tr])
+            preds = inter_stacking.predict(X_arr[ts])
+            scores.append(accuracy_score(y_arr[ts], preds))
+        res[('Ensemble Learning', 'Inter_Family_Stacking_Ensemble')] = float(np.mean(scores))
+        print(f"    {'Inter_Family_Stacking_Ensemble':<35}: {res[('Ensemble Learning', 'Inter_Family_Stacking_Ensemble')]:.4f}")
 
         all_accuracies[n] = res
 
-    # Create summary DataFrame
+    # Create MultiIndex DataFrame (Level 0: Family / Ensemble, Level 1: Model Name)
     df_results = pd.DataFrame(all_accuracies).T
     df_results.index.name = 'n_parts (1D Column)'
 
-    # Row Averages (Average accuracy for each n_parts)
-    df_results['Average_Accuracy_by_N_Parts'] = df_results.mean(axis=1)
-
-    # Column Averages (Average accuracy for each model across all n_parts)
+    # Column Averages (Average accuracy across all n_parts)
     df_results.loc['Average_Accuracy_by_Model'] = df_results.mean(axis=0)
 
-    print("\n" + "=" * 60)
-    print("FINAL MODEL PERFORMANCE SUMMARY (ACCURACY):")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("TOP 3 FAMILIES & ENSEMBLE LEARNING SUMMARY:")
+    print("=" * 70)
     print(df_results.to_string())
 
-    excel_path = os.path.join(base_dir, "new_excel_sheet.xlsx")
+    excel_path = os.path.join(base_dir, "final_excel.xlsx")
     try:
         df_results.to_excel(excel_path)
-        print(f"\nResults saved to: {excel_path}")
+        print(f"\nTop 3 Families & Ensemble results successfully saved to: {excel_path}")
     except Exception as e:
         print(f"\nNote: Could not save Excel file ({e}). Results displayed above.")
 
